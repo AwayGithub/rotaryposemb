@@ -1,0 +1,41 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.out
+
+# Runtime / test data
+input/
+output/
+*.bin
+*.npy
+*.npz
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local notes / secrets / intermediate dumps
+HANDOFF.md
+*.pem
+*cookies*
+private.pem
+.cj/
+tmp/
+.opencode/
+
+# Intermediate kernel snapshots (keep kernel.asc only as canonical)
+kernel_pass_*.asc
+restore_*.asc
