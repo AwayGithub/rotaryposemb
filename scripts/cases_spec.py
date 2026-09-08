@@ -56,9 +56,10 @@ CASES: List[CaseSpec] = [
     {"id": 16, "dtype": 0, "shape": (1, 16, 1, 1024), "theta": 10000.0, "pos": ("uniform", 0, 131072), "tag": "dim1024-edge"},
     # 17: official example2 DeepSeek V3-like
     {"id": 17, "dtype": 1, "shape": (2, 512, 128, 64), "theta": 10000.0, "pos": ("uniform", 0, 8192), "tag": "official-ex2-deepseek"},
-    # 18-19: long seq / single token
+    # 18: long seq
     {"id": 18, "dtype": 1, "shape": (1, 4096, 1, 64), "theta": 10000.0, "pos": ("uniform", 0, 131072), "tag": "long-seq"},
-    {"id": 19, "dtype": 0, "shape": (1, 1, 1, 16), "theta": 10000.0, "pos": ("uniform", 0, 50), "tag": "single-token"},
+    # 19: large unaligned — stresses host pack/unpack (P0 path)
+    {"id": 19, "dtype": 1, "shape": (2, 256, 32, 24), "theta": 10000.0, "pos": ("uniform", 0, 8192), "tag": "large-unaligned-host"},
 ]
 
 

@@ -23,6 +23,7 @@ target_link_libraries(rotary_pos_emb_custom PRIVATE
     dl
     m
     graph_base
+    pthread
 )
 
 target_include_directories(rotary_pos_emb_custom PRIVATE
@@ -31,4 +32,7 @@ target_include_directories(rotary_pos_emb_custom PRIVATE
 
 target_compile_options(rotary_pos_emb_custom PRIVATE
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${SOC_ARCH}>
+    $<$<COMPILE_LANGUAGE:CXX>:-O2>
+    $<$<COMPILE_LANGUAGE:ASC>:-O2>
 )
+
