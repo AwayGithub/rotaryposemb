@@ -20,14 +20,19 @@ rotaryposemb/
 ├── main.asc            # 本地通用测试主程序
 ├── data_utils.h        # 读写 bin 工具
 ├── CMakeLists.txt
+├── build.sh / run.py   # Ascend C Toolkit 编译/运行入口
 ├── run.sh              # 一键编译 + 小例验证
 ├── test_matrix.py      # 多 shape / dtype 精度矩阵
+├── docs/
+│   ├── problem.md      # 官方完整题面
+│   └── problem.raw.json
 └── scripts/
     ├── gen_data.py
     ├── RotaryPosEmb.py # golden 参考
     └── verify_result.py
 ```
 
+官方题面见 [docs/problem.md](docs/problem.md)。
 ## 环境
 
 - Ascend NPU（默认 `dav-2201` / Ascend 910）

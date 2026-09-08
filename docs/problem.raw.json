@@ -1,0 +1,748 @@
+{
+  "_id": "6a9a9befbf41025d60143218",
+  "ID": 1743,
+  "contest_id": "6a9a95acbf41025d601302e5",
+  "user_id": "69ca1fcd93cbe9c76cffc415",
+  "name": "rotaryposemb",
+  "canonical_name": "rotaryposemb",
+  "version_no": 1,
+  "version_label": "v1",
+  "title": "RotaryPosEmb",
+  "desc": "# RotaryPosEmb算子\r\n\r\n## 一、赛题背景\r\n\r\n旋转位置编码（Rotary Position Embedding，RoPE）是现代大语言模型注入位置信息的核心机制，被 Llama、Qwen、DeepSeek、GLM 等主流模型广泛采用。RoPE 将 token 向量的维度配对为二维平面上的点，并按\"频率 × 位置\"的角度对每对维度做旋转，从而在不引入可学习参数的前提下编码相对位置关系。\r\n\r\n本题要求基于 PyTorch 中旋转位置编码的核心业务逻辑，采用 Ascend C 编程语言进行算子原生开发，在昇腾 NPU 硬件上实现一款高性能的 RotaryPosEmb 算子。\r\n\r\n## 二、算子功能描述\r\n\r\n实现的 RotaryPosEmb 算子需完成以下核心计算：\r\n\r\n1. 根据维度与 theta 计算逆频率 `inv_freq[i] = 1 / theta^(2i/dim)`\r\n2. 由位置索引与逆频率生成旋转角，进而计算 cos/sin\r\n3. 对输入张量施加旋转位置编码：将 x 的最后一维配对后按对应旋转角旋转，得到输出 y\r\n\r\n算子输入的 x 为解耦出来的位置编码子维度（rope 部分），只对 rope_dim 做旋转。\r\n\r\n## 三、核心定义与约束\r\n\r\n### 3.1 参考算子\r\n\r\nPyTorch 中旋转位置编码的一种等价实现如下。旋转的具体实现方式（rotate-half、复数乘法或其他数学等价方法）不限，以下实现仅用于说明数学逻辑：\r\n\r\n```python\r\nimport torch\r\n\r\n\r\ndef apply_rotary_pos_emb(x, positions, theta):\r\n    dim = x.shape[-1]\r\n    # 1. 逆频率\r\n    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))\r\n\r\n    # 2. 旋转角与 cos/sin\r\n    freqs = positions.float().unsqueeze(-1) * inv_freq      # [B, S, dim/2]\r\n    theta_freqs = torch.cat([freqs, freqs], dim=-1)          # [B, S, dim]\r\n    cos = torch.cos(theta_freqs).unsqueeze(2)                # [B, S, 1, dim]\r\n    sin = torch.sin(theta_freqs).unsqueeze(2)\r\n\r\n    # 3. rotate-half 旋转\r\n    def rotate_half(t):\r\n        t1, t2 = t[..., : dim // 2], t[..., dim // 2 :]\r\n        return torch.cat((-t2, t1), dim=-1)\r\n\r\n    return x * cos + rotate_half(x) * sin\r\n```\r\n\r\n### 3.2 数学公式\r\n\r\n设输入 `x` 的最后一维为 `dim`（rope_dim），位置索引为 `p`（来自 positions），基础逆频率：\r\n\r\n$$\\text{inv\\_freq}[i] = \\theta^{-2i/\\text{dim}}, \\quad i = 0, 1, \\dots, \\text{dim}/2 - 1$$\r\n\r\n旋转角与三角函数：\r\n\r\n$$\\Theta[b,s] = \\text{concat}\\left(\\ p[b,s] \\cdot \\text{inv\\_freq}[i],\\ p[b,s] \\cdot \\text{inv\\_freq}[i]\\ \\right)$$\r\n\r\n$$\\text{cos} = \\cos(\\Theta), \\quad \\text{sin} = \\sin(\\Theta)$$\r\n\r\n旋转位置编码（x 的最后一维分成前后两半，前 dim/2 维与后 dim/2 维两两配对，第 i 对共享旋转角 $\\theta_i = p[b,s]\\cdot\\text{inv\\_freq}[i]$）：\r\n\r\n$$y[\\dots, i] = x[\\dots, i]\\cos\\theta_i - x[\\dots, i+\\text{dim}/2]\\sin\\theta_i$$\r\n\r\n$$y[\\dots, i+\\text{dim}/2] = x[\\dots, i+\\text{dim}/2]\\cos\\theta_i + x[\\dots, i]\\sin\\theta_i$$\r\n\r\n其中 $i = 0, 1, \\dots, \\text{dim}/2 - 1$。旋转的具体实现方式不限，任何数学等价方法（如 rotate-half、复数乘法等）均可。\r\n\r\n### 3.3 输入输出与属性总览\r\n\r\n| 类型         | 参数名    | 类型   | 维度形状            | 支持数据类型     | 数据格式  | 备注                            |\r\n| ------------ | --------- | ------ | ------------------- | ---------------- | --------- | ------------------------------- |\r\n| INPUT(必选)  | x         | tensor | (B, S, H, rope_dim) | float16, float32 | ND        | 待旋转的 rope 子维度张量        |\r\n| INPUT(必选)  | positions | tensor | (B, S)              | int32            | ND        | 每个 token 的位置索引           |\r\n| ATTR(属性)   | theta     | float  | -                   | -                | -         | RoPE 基础频率基数，默认 10000.0 |\r\n| OUTPUT(输出) | y         | tensor | 与 x 一致           | 与 x 一致        | 与 x 一致 | 旋转位置编码后的输出            |\r\n\r\n### 3.4 关键输入约束\r\n\r\n- **数据类型**: float16, float32\r\n\r\n- **维度场景**: 4维输入（B, S, H, rope_dim），B 为 batch，S 为序列长度，H 为头数，rope_dim 为位置编码维度\r\n\r\n- **维度取值范围（均为正整数）**:\r\n  - B（batch）: [1, 128]\r\n  - S（序列长度）: [1, 8192]\r\n  - H（头数）: [1, 256]\r\n  - rope_dim（位置编码维度）: [16, 1024]，且必须为偶数\r\n\r\n- **位置索引约束**: positions 中每个元素为 [0, 131072] 的整数，表示绝对位置\r\n\r\n- **典型 shape**:\r\n  - DeepSeek V3 实际场景: (B, S, 128, 64)，rope_dim=64，128 个 head\r\n  - 小规模调试: (1, 8, 1, 16)\r\n\r\n- **非对齐场景**: rope_dim、H、S 的任意组合可能导致非对齐的内存访问，算子需正确处理\r\n\r\n### 3.5 核心属性说明\r\n\r\n- **theta**（float，默认 10000.0）: RoPE 的几何级数基数，决定各维度频率的分布范围\r\n\r\n### 3.6 输出严格要求\r\n\r\n- **形状约束**: y.shape == x.shape，所有维度尺寸不变\r\n- **类型约束**: y 的数据类型与 x 一致\r\n- **数值等价**: 输出与 PyTorch 参考实现在合理浮点误差范围内一致\r\n- **中间精度要求**: inv_freq 计算、三角函数 cos/sin 生成必须使用 FP32 精度，避免长序列下角度误差累积\r\n\r\n### 3.7 特殊值处理规则\r\n\r\n- **NaN/Inf 输入**: 输入含 NaN/Inf 时，输出对应位置为 NaN/Inf，算子不应崩溃\r\n- **位置为 0**: positions 为 0 时，cos=1、sin=0，输出 y == x（旋转角为 0）\r\n- **rope_dim 边界**: rope_dim 为偶数，旋转配对的前后两半各为 dim/2 维\r\n\r\n## 四、规则要求\r\n\r\n1. **cos/sin 生成规则**: 逆频率计算与三角函数 cos/sin 的生成在算子内部完成，cos/sin 不作为算子输入\r\n\r\n2. **实现方式规则**: 旋转位置编码的具体实现方式不限（如 rotate-half、复数乘法等），任何与数学定义等价的实现均可\r\n\r\n3. **中间精度规则**: 逆频率与三角函数计算必须使用 FP32 精度，旋转乘法可在输入精度下进行，需保证最终输出与 golden 的误差在阈值内\r\n\r\n## 五、精度判断规则\r\n\r\n精度要求：计算结果需满足以下精度误差要求：\r\n\r\n- float32：相对误差 < 1e-4，绝对误差 < 1e-4（双万分之一精度）\r\n- float16、bfloat16：相对误差 < 1e-3，绝对误差 < 1e-3（双千分之一精度）\r\n- int32：要求计算结果完全准确，无误差\r\n\r\n## 六、得分规则\r\n- 本次比赛共15个测试点，所有case点精度全部通过才会计分。\r\n- 每个测试点单独计分，逻辑如下（T为最优性能，t为当前提交性能）：\r\n$$\r\n\\frac{100}{1+\\log_{1.5}\\frac{t}{T}}\r\n$$\r\n- 排行榜显示的最终分数为所有case得分的均值。若得分计算一致，则以提交时间进行排序，提交越早，排名越高。\r\n\r\n## 七、示例说明\r\n\r\n**示例1**: 极小规模调试\r\n\r\n- 输入 x: shape=[1, 8, 1, 16], dtype=float32\r\n- positions: shape=[1, 8], 值为 0~7 的连续位置\r\n- 属性: theta=10000.0\r\n- 输出 y: shape=[1, 8, 1, 16]，为 x 按各自位置旋转后的结果\r\n\r\n**示例2**: DeepSeek V3 实际场景\r\n\r\n- 输入 x: shape=[2, 512, 128, 64], dtype=float16\r\n- positions: shape=[2, 512]，值为 [0, 8192) 的随机位置\r\n- 属性: theta=10000.0\r\n- 输出 y: shape=[2, 512, 128, 64]\r\n\r\n**示例3**: 非对齐 rope_dim\r\n\r\n- 输入 x: shape=[2, 16, 3, 24], dtype=float16（rope_dim=24 非 2 的幂）\r\n- positions: shape=[2, 16]\r\n- 属性: theta=10000.0\r\n- 输出 y: shape=[2, 16, 3, 24]",
+  "code_template": "npu_kernel_dev",
+  "cann_version": "9.0.0",
+  "create_time": "2026-09-04T10:22:39.683Z",
+  "start_time": "2026-09-04T16:00:00.000Z",
+  "end_time": "2026-10-17T10:00:00.000Z",
+  "score_mode": 1,
+  "use_baseline": false,
+  "iterations": 5,
+  "difficulty": 1,
+  "kernel_pattern": "vector",
+  "tags": [
+    "vector",
+    "CANN：9.0.0"
+  ],
+  "testcases": [
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d6014321d",
+        "type": "default",
+        "baseline": null,
+        "ID": 11471
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143221",
+        "type": "default",
+        "baseline": null,
+        "ID": 11472
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143225",
+        "type": "default",
+        "baseline": null,
+        "ID": 11473
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143229",
+        "type": "default",
+        "baseline": null,
+        "ID": 11474
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d6014322d",
+        "type": "default",
+        "baseline": null,
+        "ID": 11475
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143231",
+        "type": "default",
+        "baseline": null,
+        "ID": 11476
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143235",
+        "type": "default",
+        "baseline": null,
+        "ID": 11477
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143239",
+        "type": "default",
+        "baseline": null,
+        "ID": 11478
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d6014323d",
+        "type": "default",
+        "baseline": null,
+        "ID": 11479
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143241",
+        "type": "default",
+        "baseline": null,
+        "ID": 11480
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143245",
+        "type": "default",
+        "baseline": null,
+        "ID": 11481
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143249",
+        "type": "default",
+        "baseline": null,
+        "ID": 11482
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d6014324d",
+        "type": "default",
+        "baseline": null,
+        "ID": 11483
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143251",
+        "type": "default",
+        "baseline": null,
+        "ID": 11484
+      }
+    },
+    {
+      "testcase_id": {
+        "_id": "6a9a9befbf41025d60143255",
+        "type": "default",
+        "baseline": null,
+        "ID": 11485
+      }
+    }
+  ],
+  "last_submission": [
+    {
+      "user_id": "6a9ecde9c76b321ca6a3e7cb",
+      "submission_id": "6a9f7d5cc76b321ca6cf8214",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c3330bf41025d6075a99d",
+      "submission_id": "6a9f5fbec76b321ca6c39abc",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d721fbf41025d60ca9a62",
+      "submission_id": "6aa004bac76b321ca606112f",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e64fdbf41025d6002d37b",
+      "submission_id": "6a9ffc97c76b321ca602d306",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf199bf41025d605fdaa1",
+      "submission_id": "6a9fdb96c76b321ca6f6c404",
+      "score": 0
+    },
+    {
+      "user_id": "6a9143d79856135024453e23",
+      "submission_id": "6aa00713c76b321ca606dc79",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf8fbbf41025d60620663",
+      "submission_id": "6a9ffdf3c76b321ca6035506",
+      "score": 0
+    },
+    {
+      "user_id": "6a5e39691336c465ba300902",
+      "submission_id": "6a9f9816c76b321ca6d86b7a",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e7315bf41025d6007c8cf",
+      "submission_id": "6aa009a5c76b321ca607ec47",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d454fbf41025d60bdb015",
+      "submission_id": "6a9f69f9c76b321ca6c79609",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bc21dbf41025d604c2d7d",
+      "submission_id": "6a9fffaec76b321ca6040857",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cc025bf41025d608f91f8",
+      "submission_id": "6a9f7454c76b321ca6cbde3a",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf0cfbf41025d605fa4fe",
+      "submission_id": "6a9f8ed2c76b321ca6d589c4",
+      "score": 0
+    },
+    {
+      "user_id": "6a7b2c58a52e0f540a859b87",
+      "submission_id": "6a9f805ac76b321ca6d09740",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d0c8fbf41025d60a8c2d0",
+      "submission_id": "6a9ffbe7c76b321ca6029080",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e72f1bf41025d6007bbef",
+      "submission_id": "6a9fbdf7c76b321ca6ea3774",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bfdebbf41025d6063b004",
+      "submission_id": "6a9f8564c76b321ca6d2ab9f",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d2f61bf41025d60b7c41c",
+      "submission_id": "6a9ec6a4bf41025d60275058",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e54a3bf41025d60fd7cf5",
+      "submission_id": "6a9feec5c76b321ca6fd9dfd",
+      "score": 0
+    },
+    {
+      "user_id": "6a5f18481336c465ba3d3994",
+      "submission_id": "6a9ec467bf41025d60267219",
+      "score": 0
+    },
+    {
+      "user_id": "6a87a0a482cffa8f166d4175",
+      "submission_id": "6a9fffa5c76b321ca6040280",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b8711bf41025d6038e627",
+      "submission_id": "6a9fc5b1c76b321ca6edb2e4",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf20fbf41025d605ff4ed",
+      "submission_id": "6aa0094fc76b321ca607c946",
+      "score": 0
+    },
+    {
+      "user_id": "6a4c5984e942bddcf7b192b9",
+      "submission_id": "6aa00187c76b321ca604d090",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bfa9abf41025d60627e5b",
+      "submission_id": "6a9fb6bec76b321ca6e6f4da",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c944dbf41025d60896405",
+      "submission_id": "6a9fb317c76b321ca6e5770a",
+      "score": 0
+    },
+    {
+      "user_id": "6a9eb430bf41025d601fb986",
+      "submission_id": "6a9eb8b0bf41025d60222e34",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b669dbf41025d6030b20d",
+      "submission_id": "6a9f8151c76b321ca6d10876",
+      "score": 0
+    },
+    {
+      "user_id": "6a6b46a279e3503efb771d90",
+      "submission_id": "6a9eb1a3bf41025d601e8eb0",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c1db7bf41025d606e8c43",
+      "submission_id": "6a9fd371c76b321ca6f391e7",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d0f46bf41025d60aa3388",
+      "submission_id": "6a9edeeac76b321ca6aaaaa0",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c20e8bf41025d606faa90",
+      "submission_id": "6a9ea6b3bf41025d601a4907",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b57bdbf41025d602ed27e",
+      "submission_id": "6a9ff2b3c76b321ca6ff468c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cd00cbf41025d6093c63f",
+      "submission_id": "6a9fee1bc76b321ca6fd5d73",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf9e3bf41025d60624b7e",
+      "submission_id": "6a9fb756c76b321ca6e73fe0",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bcbafbf41025d6050e0cb",
+      "submission_id": "6a9ea2f8bf41025d6018e601",
+      "score": 0
+    },
+    {
+      "user_id": "6a8c11b682cffa8f16e7c568",
+      "submission_id": "6a9fff0fc76b321ca603c379",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b6a3abf41025d6031502c",
+      "submission_id": "6a9e9ecbbf41025d60177a8e",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d25bcbf41025d60b49ff2",
+      "submission_id": "6a9e9d74bf41025d6016f7d5",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d9f66bf41025d60d76593",
+      "submission_id": "6aa0092fc76b321ca607befd",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e1c93bf41025d60ed0527",
+      "submission_id": "6a9ff255c76b321ca6ff19e9",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e8936bf41025d601050c1",
+      "submission_id": "6a9e922abf41025d6012fdae",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bdcfdbf41025d6058a13f",
+      "submission_id": "6a9ff3a9c76b321ca6ffa6bc",
+      "score": 0
+    },
+    {
+      "user_id": "6a9531cf9856135024d9cf00",
+      "submission_id": "6a9fc6b7c76b321ca6ee1613",
+      "score": 0
+    },
+    {
+      "user_id": "6a5f3fa21336c465ba46fee4",
+      "submission_id": "6a9fe082c76b321ca6f88b9c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e761abf41025d60091862",
+      "submission_id": "6a9edc3ac76b321ca6a9b96d",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d29bdbf41025d60b5ecb7",
+      "submission_id": "6a9e7d97bf41025d600bfb31",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cf766bf41025d609fc910",
+      "submission_id": "6a9fab32c76b321ca6e24a06",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e537cbf41025d60fd1a7e",
+      "submission_id": "6a9e79a5bf41025d600a8324",
+      "score": 0
+    },
+    {
+      "user_id": "6a69c20479e3503efb46fb42",
+      "submission_id": "6a9e74ebbf41025d60089b95",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b9464bf41025d603cc370",
+      "submission_id": "6a9e6eecbf41025d60064300",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d2ce0bf41025d60b6ebba",
+      "submission_id": "6aa004a3c76b321ca606065d",
+      "score": 0
+    },
+    {
+      "user_id": "6a967ad6bf41025d60753a45",
+      "submission_id": "6a9f9cbcc76b321ca6d9f7c9",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b6fccbf41025d603297ba",
+      "submission_id": "6a9ffb89c76b321ca6026a95",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e5206bf41025d60fca306",
+      "submission_id": "6a9e5263bf41025d60fcc2a8",
+      "score": 0
+    },
+    {
+      "user_id": "6a4c5b37e942bddcf7b1a306",
+      "submission_id": "6a9e522dbf41025d60fcb0d8",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cf57cbf41025d609f464f",
+      "submission_id": "6a9e3b20bf41025d60f638ef",
+      "score": 0
+    },
+    {
+      "user_id": "6a788668a52e0f540a7778c2",
+      "submission_id": "6a9e28f9bf41025d60f0f595",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b74f8bf41025d6033de36",
+      "submission_id": "6a9fed56c76b321ca6fd141f",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c2daabf41025d6073f567",
+      "submission_id": "6a9e0f8fbf41025d60e933a3",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d274ebf41025d60b523dc",
+      "submission_id": "6a9e028fbf41025d60e629ac",
+      "score": 0
+    },
+    {
+      "user_id": "6a6773cd79e3503efb285d6f",
+      "submission_id": "6a9dba96bf41025d60dc9a4a",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d8127bf41025d60cf5aec",
+      "submission_id": "6a9d8f81bf41025d60d349ce",
+      "score": 0
+    },
+    {
+      "user_id": "6a38e20505b7e3334163e3e4",
+      "submission_id": "6a9d8f37bf41025d60d3353e",
+      "score": 0
+    },
+    {
+      "user_id": "6a5dc6d51336c465ba27fca0",
+      "submission_id": "6a9d8973bf41025d60d1bb68",
+      "score": 0
+    },
+    {
+      "user_id": "6a856dc8a52e0f540acd92ea",
+      "submission_id": "6a9d87acbf41025d60d1278c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d7384bf41025d60cb1557",
+      "submission_id": "6a9d8568bf41025d60d073e9",
+      "score": 0
+    },
+    {
+      "user_id": "6a8d999682cffa8f161c4bb9",
+      "submission_id": "6a9d75f0bf41025d60cbdaa3",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b917dbf41025d603c0b1b",
+      "submission_id": "6a9d743ebf41025d60cb561b",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bb19fbf41025d60456a90",
+      "submission_id": "6a9d6927bf41025d60c7eec3",
+      "score": 0
+    },
+    {
+      "user_id": "6a66f0ed79e3503efb203e90",
+      "submission_id": "6a9d5894bf41025d60c2cd0c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d3b0fbf41025d60bb0f5e",
+      "submission_id": "6a9d4f7bbf41025d60c04b6c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d46aebf41025d60be01f6",
+      "submission_id": "6a9d47eabf41025d60be5924",
+      "score": 0
+    },
+    {
+      "user_id": "6a719d10eff6447fafa80746",
+      "submission_id": "6a9fa940c76b321ca6e1914b",
+      "score": 0
+    },
+    {
+      "user_id": "6a9563549856135024e206b5",
+      "submission_id": "6aa007ecc76b321ca6072c3f",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b8752bf41025d6038fa9e",
+      "submission_id": "6a9d24a3bf41025d60b44310",
+      "score": 0
+    },
+    {
+      "user_id": "6a980f83bf41025d60b0c3f1",
+      "submission_id": "6a9d2159bf41025d60b31bcb",
+      "score": 0
+    },
+    {
+      "user_id": "6a699b1779e3503efb419058",
+      "submission_id": "6a9d19cbbf41025d60b02da5",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cdf4dbf41025d6098827d",
+      "submission_id": "6a9d1720bf41025d60aeffa2",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bf9a2bf41025d6062370a",
+      "submission_id": "6a9d0ac9bf41025d60a7d73f",
+      "score": 0
+    },
+    {
+      "user_id": "6a9cf3aabf41025d609eba5e",
+      "submission_id": "6a9cfa7dbf41025d60a0b8dd",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b6ccabf41025d6031df03",
+      "submission_id": "6a9cea36bf41025d609bc12c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b9942bf41025d603dff07",
+      "submission_id": "6aa0040ac76b321ca605cb15",
+      "score": 0
+    },
+    {
+      "user_id": "6a9c18f7bf41025d606cd91b",
+      "submission_id": "6a9cdce0bf41025d6097bed3",
+      "score": 0
+    },
+    {
+      "user_id": "6a9ad811bf41025d601de09d",
+      "submission_id": "6a9ff3fcc76b321ca6ffca5c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bfbf2bf41025d60630d90",
+      "submission_id": "6a9cc25ebf41025d60900550",
+      "score": 0
+    },
+    {
+      "user_id": "6a833a13a52e0f540ab7ddcc",
+      "submission_id": "6a9f56e2c76b321ca6c13210",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bc003bf41025d604b1347",
+      "submission_id": "6a9c3e35bf41025d6079187a",
+      "score": 0
+    },
+    {
+      "user_id": "6a9be7a0bf41025d605cca15",
+      "submission_id": "6a9c3789bf41025d60771c70",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b7ebbbf41025d60368497",
+      "submission_id": "6a9c00c4bf41025d6064aae2",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bdfd3bf41025d6059d4c2",
+      "submission_id": "6a9bf368bf41025d60605c05",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b6dfbbf41025d6032207a",
+      "submission_id": "6a9bf211bf41025d605ff656",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bdee3bf41025d60597cab",
+      "submission_id": "6a9be9d7bf41025d605d8860",
+      "score": 0
+    },
+    {
+      "user_id": "6a9b9732bf41025d603d79f0",
+      "submission_id": "6a9be182bf41025d605a7f18",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bdbdabf41025d60583557",
+      "submission_id": "6a9bdffebf41025d6059e5d3",
+      "score": 0
+    },
+    {
+      "user_id": "6a4c58cee942bddcf7b185ed",
+      "submission_id": "6a9ff5d2c76b321ca60067cd",
+      "score": 0
+    },
+    {
+      "user_id": "6a9bccbebf41025d60516d10",
+      "submission_id": "6a9bce5abf41025d60523275",
+      "score": 0
+    },
+    {
+      "user_id": "6a7ee2bda52e0f540a9b4e70",
+      "submission_id": "6a9bc0c8bf41025d604b7926",
+      "score": 0
+    },
+    {
+      "user_id": "6a9ba2b2bf41025d60407506",
+      "submission_id": "6a9bab1cbf41025d604331c5",
+      "score": 0
+    },
+    {
+      "user_id": "6a5db2af1336c465ba26920f",
+      "submission_id": "6a9fdc3ac76b321ca6f6fec5",
+      "score": 0
+    },
+    {
+      "user_id": "6a9edbcbc76b321ca6a98abb",
+      "submission_id": "6a9f1799c76b321ca6b83a86",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e6e23bf41025d600605c8",
+      "submission_id": "6a9fb129c76b321ca6e4a75d",
+      "score": 0
+    },
+    {
+      "user_id": "6a85952b82cffa8f165442e6",
+      "submission_id": "6a9fd4a5c76b321ca6f4285c",
+      "score": 0
+    },
+    {
+      "user_id": "6a9f6a90c76b321ca6c7e243",
+      "submission_id": "6a9f8b9ec76b321ca6d49e74",
+      "score": 0
+    },
+    {
+      "user_id": "69ca1fcd93cbe9c76cffc415",
+      "submission_id": "6a9f80ffc76b321ca6d0e74c",
+      "score": 0
+    },
+    {
+      "user_id": "6a6af78379e3503efb66f19a",
+      "submission_id": "6a9fade2c76b321ca6e35548",
+      "score": 0
+    },
+    {
+      "user_id": "6a9f8c5cc76b321ca6d4d250",
+      "submission_id": "6aa00134c76b321ca604adcf",
+      "score": 0
+    },
+    {
+      "user_id": "6a9f8f3ec76b321ca6d5abec",
+      "submission_id": "6a9fb1e7c76b321ca6e4fca8",
+      "score": 0
+    },
+    {
+      "user_id": "6a9f80f3c76b321ca6d0e125",
+      "submission_id": "6a9f9311c76b321ca6d6da80",
+      "score": 0
+    },
+    {
+      "user_id": "6a90360982cffa8f16758810",
+      "submission_id": "6aa00771c76b321ca606fb2d",
+      "score": 0
+    },
+    {
+      "user_id": "6a9f99efc76b321ca6d903d0",
+      "submission_id": "6aa00565c76b321ca606486d",
+      "score": 0
+    },
+    {
+      "user_id": "6a9e67c1bf41025d6003a3d4",
+      "submission_id": "6a9ff9d7c76b321ca601c9a8",
+      "score": 0
+    },
+    {
+      "user_id": "6a9faf8bc76b321ca6e3fb16",
+      "submission_id": "6a9fc527c76b321ca6ed806b",
+      "score": 0
+    },
+    {
+      "user_id": "6a9d5255bf41025d60c11f8b",
+      "submission_id": "6a9ffc78c76b321ca602c830",
+      "score": 0
+    },
+    {
+      "user_id": "6a9eb6d2bf41025d60217d92",
+      "submission_id": "6a9fe1d6c76b321ca6f90cc5",
+      "score": 0
+    },
+    {
+      "user_id": "6a9fc53cc76b321ca6ed8619",
+      "submission_id": "6a9ff75ac76b321ca600e800",
+      "score": 0
+    },
+    {
+      "user_id": "6a9ff1a6c76b321ca6fecb4d",
+      "submission_id": "6a9ff1b9c76b321ca6fed10e",
+      "score": 0
+    },
+    {
+      "user_id": "6a9fffafc76b321ca6040975",
+      "submission_id": "6a9fffc7c76b321ca60415dd",
+      "score": 0
+    },
+    {
+      "user_id": "6a9ffcf2c76b321ca602fd36",
+      "submission_id": "6aa007cac76b321ca6071da6",
+      "score": 0
+    }
+  ],
+  "ranking_submission_mode": "latest",
+  "__v": 0,
+  "version_root_id": "6a9a9befbf41025d60143218"
+}
