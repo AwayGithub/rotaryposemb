@@ -23,7 +23,6 @@ target_link_libraries(rotary_pos_emb_custom PRIVATE
     dl
     m
     graph_base
-    pthread
 )
 
 target_include_directories(rotary_pos_emb_custom PRIVATE
