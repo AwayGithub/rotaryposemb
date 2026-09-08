@@ -32,7 +32,9 @@ rotaryposemb/
     └── verify_result.py
 ```
 
-官方题面见 [docs/problem.md](docs/problem.md)。
+- 官方题面：[docs/problem.md](docs/problem.md)
+- **后续 Agent 交接**：[docs/AGENT_HANDOFF.md](docs/AGENT_HANDOFF.md)（状态/提交/性能/红线）
+- 上板与探测分析：`perf_onboard/ANALYSIS.md`、`PROBE_SUBMIT.md`
 ## 环境
 
 - Ascend NPU（默认 `dav-2201` / Ascend 910）
